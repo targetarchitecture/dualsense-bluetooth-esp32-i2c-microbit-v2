@@ -28,6 +28,9 @@
 #define I2C_SDA_PIN 21
 #define I2C_SCL_PIN 22
 
+volatile unsigned long lastUpdateMs = 0;
+const unsigned long FAILSAFE_TIMEOUT_MS = 500;  // no data for 500ms -> zero out
+
 ControllerPtr myControllers[BP32_MAX_GAMEPADS];
 
 // ---- Shared state sent over I2C ----
@@ -37,19 +40,19 @@ struct __attribute__((packed)) PadState {
   uint8_t buttons_lo;  // ctl->buttons() low byte
   uint8_t buttons_hi;  // ctl->buttons() high byte
   uint8_t dpad;        // ctl->dpad()
-  int8_t  leftX;       // -127..127
-  int8_t  leftY;
-  int8_t  rightX;
-  int8_t  rightY;
-  uint8_t brake;       // L2, 0..255
-  uint8_t throttle;    // R2, 0..255
+  int8_t leftX;        // -127..127
+  int8_t leftY;
+  int8_t rightX;
+  int8_t rightY;
+  uint8_t brake;     // L2, 0..255
+  uint8_t throttle;  // R2, 0..255
 };
 
-volatile PadState padState = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+volatile PadState padState = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 
 // Helper: scale Bluepad32's ~ -512..512 stick range down to int8
 int8_t scaleAxis(int32_t v) {
-  int32_t scaled = v / 4; // -512..512 -> roughly -128..128
+  int32_t scaled = v / 4;  // -512..512 -> roughly -128..128
   if (scaled > 127) scaled = 127;
   if (scaled < -127) scaled = -127;
   return (int8_t)scaled;
@@ -94,30 +97,56 @@ void onDisconnectedController(ControllerPtr ctl) {
     if (myControllers[i] == ctl) {
       Serial.printf("Controller disconnected from slot %d\n", i);
       myControllers[i] = nullptr;
-      padState.connected = 0;
-      // zero everything else so the micro:bit doesn't act on stale data
-      padState.buttons_lo = padState.buttons_hi = padState.dpad = 0;
-      padState.leftX = padState.leftY = padState.rightX = padState.rightY = 0;
-      padState.brake = padState.throttle = 0;
+      
+    //   padState.connected = 0;
+    //   // zero everything else so the micro:bit doesn't act on stale data
+    //   padState.buttons_lo = padState.buttons_hi = padState.dpad = 0;
+    //   padState.leftX = padState.leftY = padState.rightX = padState.rightY = 0;
+    //   padState.brake = padState.throttle = 0;
+
+   // zero everything else so the micro:bit doesn't act on stale data
+      failsafeZero();
+
       break;
     }
   }
 }
 
+
+void dumpGamepad(ControllerPtr ctl) {
+  Serial.printf(
+    "idx=%d, dpad=0x%02x, buttons=0x%04x, axis L=%4d,%4d R=%4d,%4d, "
+    "brake=%4d, throttle=%4d, misc=0x%02x, gyro=%d,%d,%d, "
+    "accel=%d,%d,%d\n",
+    ctl->index(), ctl->dpad(), ctl->buttons(), ctl->axisX(), ctl->axisY(),
+    ctl->axisRX(), ctl->axisRY(), ctl->brake(), ctl->throttle(),
+    ctl->miscButtons(), ctl->gyroX(), ctl->gyroY(), ctl->gyroZ(),
+    ctl->accelX(), ctl->accelY(), ctl->accelZ());
+}
+
+void failsafeZero() {
+  padState.connected = 0;
+  padState.buttons_lo = padState.buttons_hi = padState.dpad = 0;
+  padState.leftX = padState.leftY = padState.rightX = padState.rightY = 0;
+  padState.brake = padState.throttle = 0;
+}
+
 void updatePadState(ControllerPtr ctl) {
-  padState.connected  = 1;
-  uint16_t buttons    = ctl->buttons();
+  padState.connected = 1;
+  uint16_t buttons = ctl->buttons();
   padState.buttons_lo = buttons & 0xFF;
   padState.buttons_hi = (buttons >> 8) & 0xFF;
-  padState.dpad       = ctl->dpad();
-  padState.leftX      = scaleAxis(ctl->axisX());
-  padState.leftY      = scaleAxis(ctl->axisY());
-  padState.rightX     = scaleAxis(ctl->axisRX());
-  padState.rightY     = scaleAxis(ctl->axisRY());
-  padState.brake      = scaleTrigger(ctl->brake());
-  padState.throttle   = scaleTrigger(ctl->throttle());
+  padState.dpad = ctl->dpad();
+  padState.leftX = scaleAxis(ctl->axisX());
+  padState.leftY = scaleAxis(ctl->axisY());
+  padState.rightX = scaleAxis(ctl->axisRX());
+  padState.rightY = scaleAxis(ctl->axisRY());
+  padState.brake = scaleTrigger(ctl->brake());
+  padState.throttle = scaleTrigger(ctl->throttle());
 
-  dumpGamepad(ctl);   // <-- add this line for serial debug output
+  lastUpdateMs = millis();
+
+  dumpGamepad(ctl);  // <-- add this line for serial debug output
 }
 
 void processControllers() {
@@ -150,16 +179,10 @@ void loop() {
   if (dataUpdated) {
     processControllers();
   }
-  delay(10);
-}
 
-void dumpGamepad(ControllerPtr ctl) {
-  Serial.printf(
-      "idx=%d, dpad=0x%02x, buttons=0x%04x, axis L=%4d,%4d R=%4d,%4d, "
-      "brake=%4d, throttle=%4d, misc=0x%02x, gyro=%d,%d,%d, "
-      "accel=%d,%d,%d\n",
-      ctl->index(), ctl->dpad(), ctl->buttons(), ctl->axisX(), ctl->axisY(),
-      ctl->axisRX(), ctl->axisRY(), ctl->brake(), ctl->throttle(),
-      ctl->miscButtons(), ctl->gyroX(), ctl->gyroY(), ctl->gyroZ(),
-      ctl->accelX(), ctl->accelY(), ctl->accelZ());
+  if (padState.connected && (millis() - lastUpdateMs > FAILSAFE_TIMEOUT_MS)) {
+    failsafeZero();
+  }
+
+  delay(10);
 }
