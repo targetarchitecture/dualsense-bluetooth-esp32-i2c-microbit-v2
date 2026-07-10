@@ -1,81 +1,134 @@
-#include <Arduino.h>
-#include <ps5.h>
-#include <Wire.h>
+/*
+ * PS5 (DualSense) controller connection for DOIT ESP32 DEVKIT V1
+ * Using the Bluepad32 library (Bluetooth HID gamepad support).
+ *
+ * REQUIRED SETUP (Arduino IDE):
+ * 1. File > Preferences > Additional Board Manager URLs, add:
+ *    https://raw.githubusercontent.com/ricardoquesada/esp32-arduino-lib-builder/master/bluepad32_files/package_esp32_bluepad32_index.json
+ *    (you can have the standard espressif URL there too, doesn't matter)
+ * 2. Tools > Board > Boards Manager > search "esp32_bluepad32" > install
+ *    (this is a SEPARATE board package from the normal "esp32" one -
+ *    it bundles Bluepad32 into the core, so you don't install Bluepad32
+ *    as a library)
+ * 3. Tools > Board > select an ESP32 board from the "Bluepad32" boards
+ *    list (e.g. "ESP32 Dev Module" under the Bluepad32 section)
+ * 4. Upload this sketch as normal
+ *
+ * Pairing:
+ * - Put the DualSense in pairing mode: hold the Create button + PS
+ *   button until the light bar flashes rapidly.
+ * - On first boot the ESP32 will show as discoverable and the
+ *   controller should connect. Bluepad32 remembers paired controllers
+ *   across reboots (stored in flash).
+ */
 
-#define I2C_DEV_ADDR 0x42
+#include <Bluepad32.h>
 
-struct GamepadState {
-    uint32_t buttons;
-    uint8_t lStickX;
-    uint8_t lStickY;
-    uint8_t rStickX;
-    uint8_t rStickY;
-    uint8_t l2Value;
-    uint8_t r2Value;
-    uint8_t battery;
-} __attribute__((packed));
+ControllerPtr myControllers[BP32_MAX_GAMEPADS];
 
-GamepadState currentState = {0, 128, 128, 128, 128, 0, 0, 0};
+void onConnectedController(ControllerPtr ctl) {
+  bool foundEmptySlot = false;
+  for (int i = 0; i < BP32_MAX_GAMEPADS; i++) {
+    if (myControllers[i] == nullptr) {
+      Serial.printf("Controller connected, slot %d\n", i);
+      ControllerProperties properties = ctl->getProperties();
+      Serial.printf("Model: %s, VID=0x%04x, PID=0x%04x\n",
+                    ctl->getModelName().c_str(), properties.vendor_id,
+                    properties.product_id);
+      myControllers[i] = ctl;
+      foundEmptySlot = true;
 
-// Bitmasks for micro:bit matching
-#define MASK_CROSS         (1 << 0)
-#define MASK_CIRCLE        (1 << 1)
-#define MASK_SQUARE        (1 << 2)
-#define MASK_TRIANGLE      (1 << 3)
-#define MASK_DPAD_UP       (1 << 4)
-#define MASK_DPAD_DOWN     (1 << 5)
-#define MASK_DPAD_LEFT     (1 << 6)
-#define MASK_DPAD_RIGHT    (1 << 7)
-#define MASK_L1            (1 << 8)
-#define MASK_R1            (1 << 9)
-#define MASK_TOUCHPAD      (1 << 10)
+      // Rumble briefly and flash the light bar to confirm connection
+      ctl->setRumble(0x80 /* left */, 0x40 /* right */);
+      ctl->setColorLED(0, 255, 0); // green light bar on DualSense
+      break;
+    }
+  }
+  if (!foundEmptySlot) {
+    Serial.println("Controller connected, but no empty slot found");
+  }
+}
 
-void onI2CRequest() {
-    Wire.write((uint8_t*)&currentState, sizeof(GamepadState));
+void onDisconnectedController(ControllerPtr ctl) {
+  for (int i = 0; i < BP32_MAX_GAMEPADS; i++) {
+    if (myControllers[i] == ctl) {
+      Serial.printf("Controller disconnected from slot %d\n", i);
+      myControllers[i] = nullptr;
+      break;
+    }
+  }
+}
+
+void dumpGamepad(ControllerPtr ctl) {
+  Serial.printf(
+      "idx=%d, dpad=0x%02x, buttons=0x%04x, axis L=%4d,%4d R=%4d,%4d, "
+      "brake=%4d, throttle=%4d, misc=0x%02x, gyro=%d,%d,%d, "
+      "accel=%d,%d,%d\n",
+      ctl->index(), ctl->dpad(), ctl->buttons(), ctl->axisX(), ctl->axisY(),
+      ctl->axisRX(), ctl->axisRY(), ctl->brake(), ctl->throttle(),
+      ctl->miscButtons(), ctl->gyroX(), ctl->gyroY(), ctl->gyroZ(),
+      ctl->accelX(), ctl->accelY(), ctl->accelZ());
+}
+
+void processGamepad(ControllerPtr ctl) {
+  // Example: react to button presses
+  if (ctl->a()) {
+    Serial.println("Cross (X) pressed");
+  }
+  if (ctl->b()) {
+    Serial.println("Circle pressed");
+  }
+  if (ctl->x()) {
+    Serial.println("Square pressed");
+  }
+  if (ctl->y()) {
+    Serial.println("Triangle pressed");
+  }
+
+  // Left/right analog sticks: -512 to 512 roughly
+  int32_t leftX = ctl->axisX();
+  int32_t leftY = ctl->axisY();
+  int32_t rightX = ctl->axisRX();
+  int32_t rightY = ctl->axisRY();
+
+  // Only print periodically to avoid flooding serial - here every call for
+  // simplicity, throttle in loop() with millis() if it's too noisy
+  dumpGamepad(ctl);
+
+  (void)leftX; (void)leftY; (void)rightX; (void)rightY;
+  // TODO: map these to your motors / servos / whatever you're driving
+}
+
+void processControllers() {
+  for (auto ctl : myControllers) {
+    if (ctl && ctl->isConnected() && ctl->hasData()) {
+      if (ctl->isGamepad()) {
+        processGamepad(ctl);
+      } else {
+        Serial.println("Unsupported controller type");
+      }
+    }
+  }
 }
 
 void setup() {
-    // Default Wire.begin() on original ESP32 automatically uses GPIO 21 & 22
-    Wire.begin(I2C_DEV_ADDR);
-    Wire.onRequest(onI2CRequest);
-    
-    // Replace with your DualSense MAC address
-    ps5.begin("1a:2b:3c:01:01:01"); 
+  Serial.begin(115200);
+  Serial.printf("Bluepad32 firmware: %s\n", BP32.firmwareVersion());
+
+  BP32.setup(&onConnectedController, &onDisconnectedController);
+
+  // If you want to forget previously paired devices, uncomment:
+  // BP32.forgetBluetoothKeys();
+
+  // Enables mouse/gamepad/keyboard reports over BLE too, PS5 uses classic BT
+  BP32.enableVirtualDevice(false);
 }
 
 void loop() {
-    if (ps5.isConnected()) {
-        uint32_t tempButtons = 0;
+  bool dataUpdated = BP32.update();
+  if (dataUpdated) {
+    processControllers();
+  }
 
-        if (ps5.Cross())    tempButtons |= MASK_CROSS;
-        if (ps5.Circle())   tempButtons |= MASK_CIRCLE;
-        if (ps5.Square())   tempButtons |= MASK_SQUARE;
-        if (ps5.Triangle()) tempButtons |= MASK_TRIANGLE;
-        if (ps5.Up())       tempButtons |= MASK_DPAD_UP;
-        if (ps5.Down())     tempButtons |= MASK_DPAD_DOWN;
-        if (ps5.Left())     tempButtons |= MASK_DPAD_LEFT;
-        if (ps5.Right())    tempButtons |= MASK_DPAD_RIGHT;
-        if (ps5.L1())       tempButtons |= MASK_L1;
-        if (ps5.R1())       tempButtons |= MASK_R1;
-        if (ps5.Touchpad()) tempButtons |= MASK_TOUCHPAD;
-
-        currentState.buttons = tempButtons;
-
-        // Convert native [-128, 127] sticks to standard unsigned [0, 255]
-        currentState.lStickX = (uint8_t)(ps5.LStickX() + 128);
-        currentState.lStickY = (uint8_t)(ps5.LStickY() + 128);
-        currentState.rStickX = (uint8_t)(ps5.RStickX() + 128);
-        currentState.rStickY = (uint8_t)(ps5.RStickY() + 128);
-
-        currentState.l2Value = ps5.L2Value();
-        currentState.r2Value = ps5.R2Value();
-        currentState.battery = ps5.Battery();
-    } else {
-        currentState.buttons = 0;
-        currentState.lStickX = 128; currentState.lStickY = 128;
-        currentState.rStickX = 128; currentState.rStickY = 128;
-        currentState.l2Value = 0;   currentState.r2Value = 0;
-        currentState.battery = 0;
-    }
-    delay(10); 
+  delay(10); // small delay is fine, Bluepad32 runs its own BT task
 }
