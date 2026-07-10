@@ -1,51 +1,91 @@
 /*
- * PS5 (DualSense) controller connection for DOIT ESP32 DEVKIT V1
- * Using the Bluepad32 library (Bluetooth HID gamepad support).
+ * PS5 (DualSense) -> ESP32 (Bluepad32) -> I2C slave -> BBC micro:bit
  *
- * REQUIRED SETUP (Arduino IDE):
- * 1. File > Preferences > Additional Board Manager URLs, add:
- *    https://raw.githubusercontent.com/ricardoquesada/esp32-arduino-lib-builder/master/bluepad32_files/package_esp32_bluepad32_index.json
- *    (you can have the standard espressif URL there too, doesn't matter)
- * 2. Tools > Board > Boards Manager > search "esp32_bluepad32" > install
- *    (this is a SEPARATE board package from the normal "esp32" one -
- *    it bundles Bluepad32 into the core, so you don't install Bluepad32
- *    as a library)
- * 3. Tools > Board > select an ESP32 board from the "Bluepad32" boards
- *    list (e.g. "ESP32 Dev Module" under the Bluepad32 section)
- * 4. Upload this sketch as normal
+ * The ESP32 keeps doing what it did before (reading the PS5 controller
+ * over Bluetooth via Bluepad32), but now also acts as an I2C SLAVE.
+ * The micro:bit is the I2C MASTER and just reads a fixed-size block of
+ * bytes whenever it wants the latest controller state.
  *
- * Pairing:
- * - Put the DualSense in pairing mode: hold the Create button + PS
- *   button until the light bar flashes rapidly.
- * - On first boot the ESP32 will show as discoverable and the
- *   controller should connect. Bluepad32 remembers paired controllers
- *   across reboots (stored in flash).
+ * WIRING (3.3V logic both sides, safe to connect directly):
+ *   ESP32 GPIO21 (SDA) -- micro:bit P20 (SDA)
+ *   ESP32 GPIO22 (SCL) -- micro:bit P19 (SCL)
+ *   ESP32 GND          -- micro:bit GND
+ * Add 4.7k pull-up resistors from SDA and SCL to 3.3V if you don't
+ * already have them (the micro:bit edge connector doesn't reliably
+ * supply them for external I2C devices).
+ *
+ * DO NOT power the micro:bit from the ESP32 3.3V pin unless you've
+ * checked current draw - easiest is to power each board separately
+ * (USB) and just share GND + SDA + SCL.
+ *
+ * Same Arduino IDE board setup as before (esp32_bluepad32 package).
  */
 
 #include <Bluepad32.h>
+#include <Wire.h>
+
+#define I2C_SLAVE_ADDR 0x42
+#define I2C_SDA_PIN 21
+#define I2C_SCL_PIN 22
 
 ControllerPtr myControllers[BP32_MAX_GAMEPADS];
 
+// ---- Shared state sent over I2C ----
+// Keep this a plain packed struct so both sides agree on byte layout.
+struct __attribute__((packed)) PadState {
+  uint8_t connected;   // 0/1
+  uint8_t buttons_lo;  // ctl->buttons() low byte
+  uint8_t buttons_hi;  // ctl->buttons() high byte
+  uint8_t dpad;        // ctl->dpad()
+  int8_t  leftX;       // -127..127
+  int8_t  leftY;
+  int8_t  rightX;
+  int8_t  rightY;
+  uint8_t brake;       // L2, 0..255
+  uint8_t throttle;    // R2, 0..255
+};
+
+volatile PadState padState = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+
+// Helper: scale Bluepad32's ~ -512..512 stick range down to int8
+int8_t scaleAxis(int32_t v) {
+  int32_t scaled = v / 4; // -512..512 -> roughly -128..128
+  if (scaled > 127) scaled = 127;
+  if (scaled < -127) scaled = -127;
+  return (int8_t)scaled;
+}
+
+// Helper: Bluepad32 throttle/brake are already roughly 0..1023 on most pads
+uint8_t scaleTrigger(int32_t v) {
+  int32_t scaled = v / 4;
+  if (scaled > 255) scaled = 255;
+  if (scaled < 0) scaled = 0;
+  return (uint8_t)scaled;
+}
+
+// ---- I2C slave callbacks ----
+void onI2CRequest() {
+  // Send the whole struct in one go; micro:bit just does a plain read.
+  Wire.write((const uint8_t*)&padState, sizeof(PadState));
+}
+
+void onI2CReceive(int numBytes) {
+  // Not used for anything yet, but drain the buffer so the bus doesn't jam
+  while (Wire.available()) {
+    Wire.read();
+  }
+}
+
+// ---- Bluepad32 callbacks ----
 void onConnectedController(ControllerPtr ctl) {
-  bool foundEmptySlot = false;
   for (int i = 0; i < BP32_MAX_GAMEPADS; i++) {
     if (myControllers[i] == nullptr) {
       Serial.printf("Controller connected, slot %d\n", i);
-      ControllerProperties properties = ctl->getProperties();
-      Serial.printf("Model: %s, VID=0x%04x, PID=0x%04x\n",
-                    ctl->getModelName().c_str(), properties.vendor_id,
-                    properties.product_id);
       myControllers[i] = ctl;
-      foundEmptySlot = true;
-
-      // Rumble briefly and flash the light bar to confirm connection
-      ctl->setRumble(0x80 /* left */, 0x40 /* right */);
-      ctl->setColorLED(0, 255, 0); // green light bar on DualSense
+      ctl->setColorLED(0, 255, 0);
+      padState.connected = 1;
       break;
     }
-  }
-  if (!foundEmptySlot) {
-    Serial.println("Controller connected, but no empty slot found");
   }
 }
 
@@ -54,9 +94,63 @@ void onDisconnectedController(ControllerPtr ctl) {
     if (myControllers[i] == ctl) {
       Serial.printf("Controller disconnected from slot %d\n", i);
       myControllers[i] = nullptr;
+      padState.connected = 0;
+      // zero everything else so the micro:bit doesn't act on stale data
+      padState.buttons_lo = padState.buttons_hi = padState.dpad = 0;
+      padState.leftX = padState.leftY = padState.rightX = padState.rightY = 0;
+      padState.brake = padState.throttle = 0;
       break;
     }
   }
+}
+
+void updatePadState(ControllerPtr ctl) {
+  padState.connected  = 1;
+  uint16_t buttons    = ctl->buttons();
+  padState.buttons_lo = buttons & 0xFF;
+  padState.buttons_hi = (buttons >> 8) & 0xFF;
+  padState.dpad       = ctl->dpad();
+  padState.leftX      = scaleAxis(ctl->axisX());
+  padState.leftY      = scaleAxis(ctl->axisY());
+  padState.rightX     = scaleAxis(ctl->axisRX());
+  padState.rightY     = scaleAxis(ctl->axisRY());
+  padState.brake      = scaleTrigger(ctl->brake());
+  padState.throttle   = scaleTrigger(ctl->throttle());
+
+  dumpGamepad(ctl);   // <-- add this line for serial debug output
+}
+
+void processControllers() {
+  for (auto ctl : myControllers) {
+    if (ctl && ctl->isConnected() && ctl->hasData() && ctl->isGamepad()) {
+      updatePadState(ctl);
+    }
+  }
+}
+
+
+
+void setup() {
+  Serial.begin(115200);
+  Serial.printf("Bluepad32 firmware: %s\n", BP32.firmwareVersion());
+
+  BP32.setup(&onConnectedController, &onDisconnectedController);
+  BP32.enableVirtualDevice(false);
+
+  Wire.begin((uint8_t)I2C_SLAVE_ADDR, I2C_SDA_PIN, I2C_SCL_PIN, 100000);
+  Wire.onRequest(onI2CRequest);
+  Wire.onReceive(onI2CReceive);
+
+  Serial.printf("I2C slave ready on address 0x%02X (SDA=%d, SCL=%d)\n",
+                I2C_SLAVE_ADDR, I2C_SDA_PIN, I2C_SCL_PIN);
+}
+
+void loop() {
+  bool dataUpdated = BP32.update();
+  if (dataUpdated) {
+    processControllers();
+  }
+  delay(10);
 }
 
 void dumpGamepad(ControllerPtr ctl) {
@@ -68,67 +162,4 @@ void dumpGamepad(ControllerPtr ctl) {
       ctl->axisRX(), ctl->axisRY(), ctl->brake(), ctl->throttle(),
       ctl->miscButtons(), ctl->gyroX(), ctl->gyroY(), ctl->gyroZ(),
       ctl->accelX(), ctl->accelY(), ctl->accelZ());
-}
-
-void processGamepad(ControllerPtr ctl) {
-  // Example: react to button presses
-  if (ctl->a()) {
-    Serial.println("Cross (X) pressed");
-  }
-  if (ctl->b()) {
-    Serial.println("Circle pressed");
-  }
-  if (ctl->x()) {
-    Serial.println("Square pressed");
-  }
-  if (ctl->y()) {
-    Serial.println("Triangle pressed");
-  }
-
-  // Left/right analog sticks: -512 to 512 roughly
-  int32_t leftX = ctl->axisX();
-  int32_t leftY = ctl->axisY();
-  int32_t rightX = ctl->axisRX();
-  int32_t rightY = ctl->axisRY();
-
-  // Only print periodically to avoid flooding serial - here every call for
-  // simplicity, throttle in loop() with millis() if it's too noisy
-  dumpGamepad(ctl);
-
-  (void)leftX; (void)leftY; (void)rightX; (void)rightY;
-  // TODO: map these to your motors / servos / whatever you're driving
-}
-
-void processControllers() {
-  for (auto ctl : myControllers) {
-    if (ctl && ctl->isConnected() && ctl->hasData()) {
-      if (ctl->isGamepad()) {
-        processGamepad(ctl);
-      } else {
-        Serial.println("Unsupported controller type");
-      }
-    }
-  }
-}
-
-void setup() {
-  Serial.begin(115200);
-  Serial.printf("Bluepad32 firmware: %s\n", BP32.firmwareVersion());
-
-  BP32.setup(&onConnectedController, &onDisconnectedController);
-
-  // If you want to forget previously paired devices, uncomment:
-  // BP32.forgetBluetoothKeys();
-
-  // Enables mouse/gamepad/keyboard reports over BLE too, PS5 uses classic BT
-  BP32.enableVirtualDevice(false);
-}
-
-void loop() {
-  bool dataUpdated = BP32.update();
-  if (dataUpdated) {
-    processControllers();
-  }
-
-  delay(10); // small delay is fine, Bluepad32 runs its own BT task
 }
