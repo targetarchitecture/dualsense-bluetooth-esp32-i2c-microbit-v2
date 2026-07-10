@@ -97,14 +97,14 @@ void onDisconnectedController(ControllerPtr ctl) {
     if (myControllers[i] == ctl) {
       Serial.printf("Controller disconnected from slot %d\n", i);
       myControllers[i] = nullptr;
-      
-    //   padState.connected = 0;
-    //   // zero everything else so the micro:bit doesn't act on stale data
-    //   padState.buttons_lo = padState.buttons_hi = padState.dpad = 0;
-    //   padState.leftX = padState.leftY = padState.rightX = padState.rightY = 0;
-    //   padState.brake = padState.throttle = 0;
 
-   // zero everything else so the micro:bit doesn't act on stale data
+      //   padState.connected = 0;
+      //   // zero everything else so the micro:bit doesn't act on stale data
+      //   padState.buttons_lo = padState.buttons_hi = padState.dpad = 0;
+      //   padState.leftX = padState.leftY = padState.rightX = padState.rightY = 0;
+      //   padState.brake = padState.throttle = 0;
+
+      // zero everything else so the micro:bit doesn't act on stale data
       failsafeZero();
 
       break;
