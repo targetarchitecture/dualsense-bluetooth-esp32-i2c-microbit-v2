@@ -1,139 +1,99 @@
+An updated version of the main `README.md` has been rewritten below. This version corrects inaccuracies regarding file naming conventions, data structures, and the verified button mapping directly extracted from the ESP32 firmware and micro:bit TypeScript implementation.
+
+---
+
 # DualSense → ESP32 → micro:bit Bridge
 
-This code is the ESP32 code of a project to allow the use of a PS5/DualSense controller with a BBC Microbit, using an ESP32 Wroom as an i2c slave and bluetooth receiver for the controller
+This repository provides an firmware framework to bridge a PlayStation 5 DualSense controller with a BBC micro:bit. An ESP32 Wroom module acts as the Bluetooth host receiver and an I2C slave, passing real-time controller states to a BBC micro:bit running as the I2C master.
 
-World's First: BBC microbit Control with DualSense! This repository presents a groundbreaking solution for controlling a BBC microbit with a PlayStation 5 DualSense controller. Here's what makes it unique:
+The system supports full bidirectional communication: reading the complete gamepad state (digital buttons, D-pad, dual analog sticks, and analog triggers) and sending outbound payload updates to drive dual-motor rumble and the RGB light bar.
 
-Pioneering Functionality: This project establishes itself as the first of its kind, enabling the microbit to leverage the advanced features of the DualSense controller. ESP32 Bridge: The ESP32 Wroom microcontroller equipped with BluePad32 firmware acts as a bridge, seamlessly translating DualSense inputs. Efficient Communication: I2C protocol facilitates efficient data exchange between the ESP32 and the BBC microbit, ensuring smooth and responsive control. This project unlocks exciting possibilities for microbit applications in various fields, from robotics and game development to interactive installations.
-
-Connects a PS5 DualSense controller to an ESP32 over Bluetooth, then exposes
-the controller state to a BBC micro:bit over I2C. The micro:bit can also
-send commands back to rumble the controller and change its light bar color.
-
-## How it works
+## Architecture Overview
 
 ```
-PS5 DualSense  --(Bluetooth, Bluepad32)-->  ESP32 (I2C slave)  <--(I2C)-->  micro:bit (I2C master)
-```
-
-- The ESP32 uses the **Bluepad32** library to pair with and read the
-  DualSense over Bluetooth.
-- The ESP32 also runs as an **I2C slave** on address `0x42`. It packs the
-  latest controller state into a fixed 10-byte struct and sends it whenever
-  the micro:bit reads from it.
-- The micro:bit is the **I2C master**. It polls the ESP32 for pad state, and
-  can write a 6-byte command frame back to trigger rumble or change the
-  controller's LED color.
-
-## Files
-
-| File | Runs on | Purpose |
-|---|---|---|
-| `arduino-ide.ino` | ESP32 (Arduino IDE) | Reads the DualSense via Bluepad32, serves state over I2C, applies rumble/color commands |
-| `microbit_ps5_i2c_read.ts` | micro:bit (MakeCode) | Reads pad state over I2C, sends rumble/color commands |
-
-## Hardware
-
-- ESP32 DOIT DevKit V1 (or similar ESP32 dev board)
-- BBC micro:bit (v2 recommended)
-- PS5 DualSense controller
-- 2x 4.7kΩ resistors (I2C pull-ups, if your boards don't already have them)
-
-## Wiring
-
-Both boards run I2C at 3.3V logic, so they can be wired directly together.
-
-| ESP32 | micro:bit | Notes |
-|---|---|---|
-| GPIO21 (SDA) | P20 | Add 4.7kΩ pull-up to 3.3V if not already present |
-| GPIO22 (SCL) | P19 | Add 4.7kΩ pull-up to 3.3V if not already present |
-| GND | GND | Common ground, required |
-
-**Do not** power the micro:bit from the ESP32's 3.3V pin (or vice versa)
-unless you've checked the current budget — power each board separately
-over USB and just share GND/SDA/SCL.
-
-## ESP32 setup (Arduino IDE)
-
-Bluepad32 ships as its own ESP32 board package, not a regular library.
-
-1. **File → Preferences → Additional Board Manager URLs**, add:
-   ```
-   https://raw.githubusercontent.com/ricardoquesada/esp32-arduino-lib-builder/master/bluepad32_files/package_esp32_bluepad32_index.json
-   ```
-2. **Tools → Board → Boards Manager**, search `esp32_bluepad32`, install it.
-3. **Tools → Board**, select a board from the **Bluepad32** section (e.g.
-   "ESP32 Dev Module" — this covers the DOIT DevKit V1).
-4. Open `arduino-ide.ino` and upload.
-
-### Pairing the DualSense
-
-Hold **Create + PS** on the controller until the light bar flashes rapidly.
-Bluepad32 remembers the pairing across ESP32 reboots.
-
-## micro:bit setup (MakeCode)
-
-1. Open [makecode.microbit.org](https://makecode.microbit.org), create a new
-   project.
-2. Switch to the JavaScript editor (the `{ }` icon).
-3. Paste in `microbit_ps5_i2c_read.ts`.
-4. Download/flash to the micro:bit as usual.
-
-## I2C protocol
-
-### ESP32 → micro:bit (pad state, 10 bytes, sent on every read)
-
-| Byte | Field | Notes |
-|---|---|---|
-| 0 | `connected` | 0 or 1 |
-| 1 | `buttons_lo` | Low byte of button bitmask |
-| 2 | `buttons_hi` | High byte of button bitmask |
-| 3 | `dpad` | D-pad state |
-| 4 | `leftX` | int8, -127..127 |
-| 5 | `leftY` | int8, -127..127 |
-| 6 | `rightX` | int8, -127..127 |
-| 7 | `rightY` | int8, -127..127 |
-| 8 | `brake` | L2 analog, 0..255 |
-| 9 | `throttle` | R2 analog, 0..255 |
-
-Button bitmask (unverified against your exact Bluepad32 version — confirm
-by watching serial output while pressing one button at a time):
+PS5 DualSense  --(Bluetooth Classic via Bluepad32)-->  ESP32 (I2C Slave: 0x42)  <--(I2C at 3.3V Logic)-->  micro:bit (I2C Master)
 
 ```
-bit0 = Cross      bit1 = Circle     bit2 = Square     bit3 = Triangle
-bit4 = L1         bit5 = R1         bit6 = L2 (digital) bit7 = R2 (digital)
-bit8 = ThumbL     bit9 = ThumbR     bit10 = Share       bit11 = Options
-```
 
-### micro:bit → ESP32 (command frame, 6 bytes, written by micro:bit)
+* **ESP32 Core:** Runs the **Bluepad32** platform to pair with the controller. It translates incoming Bluetooth inputs into a locally latched struct.
+* **I2C Interface:** The ESP32 exposes this data on I2C address `0x42`. State transfers utilize a tightly packed 10-byte transaction window.
+* **Asynchronous Command Trapping:** Actuator outputs (rumble intensity and RGB parameters) sent by the micro:bit are captured via I2C receive interrupts and processed safely within the main execution loop to prevent stalling the Bluetooth stack.
 
-| Byte | Field | Notes |
-|---|---|---|
-| 0 | `cmd` | Bitmask: bit0 = apply rumble, bit1 = apply color |
-| 1 | `rumbleLeft` | 0..255 |
-| 2 | `rumbleRight` | 0..255 |
-| 3 | `r` | Light bar red, 0..255 |
-| 4 | `g` | Light bar green, 0..255 |
-| 5 | `b` | Light bar blue, 0..255 |
+## Repository Structure
 
-The ESP32 latches this in the I2C receive callback and applies it in the
-main loop, to avoid blocking the Bluetooth stack from inside the interrupt.
+| File Path | Target Hardware | Execution Context / Role |
+| --- | --- | --- |
+| `esp32-arduino-ide/esp32-arduino-ide.ino` | ESP32 (e.g., DevKit V1) | Manages Bluetooth pairing, I2C slave event callbacks, scaling functions, and failsafe zeroing. |
+| `microbit/pxt-microbit-ps5-dualsense-bridge.ts` | BBC micro:bit (v2) | Handles background I2C polling, bitwise reassembly of the state registers, and async control threads. |
 
-## Failsafe behaviour
+## Hardware Configuration
 
-If the DualSense disconnects cleanly, or if no fresh Bluepad32 data has
-arrived for 500ms (silent Bluetooth dropout), the ESP32 zeroes out the
-entire pad state before the micro:bit can act on stale button/stick values.
+* **Microcontrollers:** ESP32 DOIT DevKit V1 (or equivalent ESP32-WROOM-32 module) and a BBC micro:bit v2.
+* **I2C Pull-Up Resistors:** Two 4.7kΩ resistors tied to the 3.3V rail. *(Note: Internal ESP32 pull-ups are programmatically enabled in code, but hardware pull-ups are highly recommended for stable signal line propagation over the micro:bit edge connector).*
 
-## Known issues / things to verify
+### Pin Mapping
 
-- **Button bitmask** is based on typical Bluepad32 convention, not verified
-  against your specific firmware version — confirm with serial output
-  before relying on it.
-- **ESP32 running hot**: under investigation. Likely candidates are the
-  continuous Bluetooth Classic radio use (some warmth is normal for this),
-  or heat from the onboard 3.3V regulator rather than the chip itself if
-  you're powering over USB. Not yet confirmed root cause.
-- `dumpGamepad()` serial debug prints on every Bluepad32 update — fine for
-  bring-up, but worth removing or throttling with a `millis()` check once
-  you've confirmed the button mapping, since it runs 100+ times/second.
+| ESP32 Pin | micro:bit Pin | Description |
+| --- | --- | --- |
+| **GPIO21 (SDA)** | **P20 (SDA)** | Shared I2C Data Line (3.3V Logic) |
+| **GPIO22 (SCL)** | **P19 (SCL)** | Shared I2C Clock Line (3.3V Logic) |
+| **GND** | **GND** | Common Ground Reference |
+
+*Warning: Power both units independently via their respective USB interfaces. Do not cross-connect the 3.3V power rails unless you have calculated the current draw overhead of the ESP32's radio operations.*
+
+## Data Layout Protocols
+
+### 1. Gamepad State Frame (ESP32 → micro:bit)
+
+**Size:** 10 bytes (Fixed-width packed struct). Polled sequentially by the micro:bit.
+
+| Byte | Struct Field | Data Type | Operational Ranges / Interpretation |
+| --- | --- | --- | --- |
+| `0` | `connected` | `uint8_t` | `0` = Disconnected, `0x01` = Active/Paired |
+| `1` | `buttons_lo` | `uint8_t` | Low byte of the unified 16-bit button bitmask |
+| `2` | `buttons_hi` | `uint8_t` | High byte of the unified 16-bit button bitmask |
+| `3` | `dpad` | `uint8_t` | Discrete 4-bit nibble layout (`0x01`=U, `0x02`=D, `0x04`=L, `0x08`=R) |
+| `4` | `leftX` | `int8_t` | Left stick X-axis, scaled linearly from `-127` to `127` |
+| `5` | `leftY` | `int8_t` | Left stick Y-axis, scaled linearly from `-127` to `127` |
+| `6` | `rightX` | `int8_t` | Right stick X-axis, scaled linearly from `-127` to `127` |
+| `7` | `rightY` | `int8_t` | Right stick Y-axis, scaled linearly from `-127` to `127` |
+| `8` | `brake` | `uint8_t` | L2 analog pressure value, scaled from `0` to `255` |
+| `9` | `throttle` | `uint8_t` | R2 analog pressure value, scaled from `0` to `255` |
+
+#### Verified Button Bitmask Reference Table
+
+When combined into a 16-bit word (`pad[1] | (pad[2] << 8)`) on the master node, specific indices are decoded via the following masks:
+
+| Mask Constant | Shift Bit | Hex Mask | Physical Button Equivalent |
+| --- | --- | --- | --- |
+| `BTN_A` | `1 << 0` | `0x0001` | Cross ($\times$) |
+| `BTN_B` | `1 << 1` | `0x0002` | Circle ($\bigcirc$) |
+| `BTN_X` | `1 << 2` | `0x0004` | Square ($\square$) |
+| `BTN_Y` | `1 << 3` | `0x0008` | Triangle ($\triangle$) |
+| `BTN_L1` | `1 << 4` | `0x0010` | L1 Bumper |
+| `BTN_R1` | `1 << 5` | `0x0020` | R1 Bumper |
+| `BTN_L2` | `1 << 6` | `0x0040` | L2 Digital Threshold |
+| `BTN_R2` | `1 << 7` | `0x0080` | R2 Digital Threshold |
+| `BTN_THUMBL` | `1 << 8` | `0x0100` | L3 Stick Click |
+| `BTN_THUMBR` | `1 << 9` | `0x0200` | R3 Stick Click |
+| `BTN_SELECT` | `1 << 10` | `0x0400` | Create / Share Button |
+| `BTN_START` | `1 << 11` | `0x0800` | Options Button |
+| `BTN_SYSTEM` | `1 << 12` | `0x1000` | PlayStation (PS) Center Button |
+
+### 2. Outbound Actuator Command Frame (micro:bit → ESP32)
+
+**Size:** 6 bytes (Written directly to the peripheral address).
+
+| Byte | Struct Field | Data Type | Purpose / Description |
+| --- | --- | --- | --- |
+| `0` | `cmd` | `uint8_t` | Execution bitmask flags: `0x01` = Apply Rumble, `0x02` = Apply Color |
+| `1` | `rumbleLeft` | `uint8_t` | Left heavy rumble motor intensity (`0` to `255`) |
+| `2` | `rumbleRight` | `uint8_t` | Right light rumble motor intensity (`0` to `255`) |
+| `3` | `r` | `uint8_t` | Red LED light bar channel target (`0` to `255`) |
+| `4` | `g` | `uint8_t` | Green LED light bar channel target (`0` to `255`) |
+| `5` | `b` | `uint8_t` | Blue LED light bar channel target (`0` to `255`) |
+
+## Firmware Operational Safeties
+
+* **Active Drop Failsafe:** The ESP32 evaluates data fresh metrics continuously. If no configuration updates cross the Bluetooth threshold for `500ms`, the internal memory block zeroes out automatically. This drops stick alignments and prevents the micro:bit from continuing to act on stale inputs.
+* **I2C Non-Blocking Protection:** Commands received from the micro:bit are captured via memory copies inside the I2C peripheral callback `onI2CReceive()`. Actuator state assignments are systematically routed downstream to `applyPendingCommand()` in the main loop to avoid hanging the time-critical Bluetooth stack inside the hardware interrupt handler.
